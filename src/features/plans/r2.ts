@@ -26,10 +26,13 @@ export async function planExists(key: string): Promise<boolean> {
  * Vercel's 4.5 MB request body cap, so the indirection would buy nothing.
  */
 export async function putPlan(key: string, html: string): Promise<void> {
+    // R2 answers 411 to a PUT without Content-Length. Vercel's runtime has been seen sending a string body chunked,
+    // so the length is stated outright instead of trusting fetch to add it.
+    const body = Buffer.from(html, "utf8");
     const response = await r2Fetch(key, {
         method: "PUT",
-        headers: { "Content-Type": "text/html; charset=utf-8" },
-        body: html,
+        headers: { "Content-Type": "text/html; charset=utf-8", "Content-Length": String(body.byteLength) },
+        body,
     });
     if (!response.ok) {
         throw new Error(`R2 PUT for ${key} failed with status ${response.status}`);
