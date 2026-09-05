@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 const ADJECTIVES = [
     "amber",
     "ancient",
@@ -222,18 +224,24 @@ const NOUNS = [
     "zephyr",
 ];
 
-function pick(list: string[]): string {
-    const [random] = crypto.getRandomValues(new Uint32Array(1));
-    return list[random % list.length];
+// Three arbitrary 32-bit values become a name: two distinct adjectives and a noun.
+function build([first, second, noun]: [number, number, number]): string {
+    const adjective = ADJECTIVES[first % ADJECTIVES.length];
+    const others = ADJECTIVES.filter((word) => word !== adjective);
+    return `${adjective}-${others[second % others.length]}-${NOUNS[noun % NOUNS.length]}`;
 }
 
 /**
- * Generates a plan name like "quiet-amber-harbor": two distinct adjectives and a noun. The space is about 1.4M
- * combinations, so the upload route still checks R2 for an existing object before writing.
+ * Generates a random plan name like "quiet-amber-harbor". The space is about a million combinations, so the upload
+ * route still checks R2 for an existing object before writing.
  */
 export function generatePlanName(): string {
-    const first = pick(ADJECTIVES);
-    let second = pick(ADJECTIVES);
-    while (second === first) second = pick(ADJECTIVES);
-    return `${first}-${second}-${pick(NOUNS)}`;
+    const [first, second, noun] = crypto.getRandomValues(new Uint32Array(3));
+    return build([first, second, noun]);
+}
+
+/** Same shape as generatePlanName, but a pure function of the seed: equal seeds always give the same name. */
+export function derivePlanName(seed: string): string {
+    const digest = createHash("sha256").update(seed).digest();
+    return build([digest.readUInt32BE(0), digest.readUInt32BE(4), digest.readUInt32BE(8)]);
 }
