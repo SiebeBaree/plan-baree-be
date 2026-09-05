@@ -1,8 +1,8 @@
-import { timingSafeEqual } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 
 import { type NextRequest, NextResponse } from "next/server";
 
-import { generatePlanName, planExists, putPlan } from "@/features/plans";
+import { derivePlanName, generatePlanName, headPlan, putPlan } from "@/features/plans";
 import { env } from "@/lib/env/server";
 import { siteUrl } from "@/lib/site";
 
@@ -10,7 +10,9 @@ import { siteUrl } from "@/lib/site";
 // instead of an opaque platform 413.
 const MAX_PLAN_BYTES = 4 * 1024 * 1024;
 
-const EXAMPLE_REQUEST = `curl --fail-with-body -X POST ${siteUrl.href} -H 'Authorization: Bearer <UPLOAD_TOKEN>' -H 'Content-Type: text/html' --data-binary @plan.html`;
+const NAME_ATTEMPTS = 5;
+
+const EXAMPLE_REQUEST = `curl --fail-with-body -X POST ${siteUrl.href} -H 'Authorization: Bearer <UPLOAD_TOKEN>' -H 'Content-Type: text/html' -H 'X-Plan-Path: /absolute/path/to/plan.html' --data-binary @/absolute/path/to/plan.html`;
 
 // Timing-safe so the token cannot be guessed byte by byte from response times.
 function isAuthorized(request: NextRequest) {
@@ -21,7 +23,12 @@ function isAuthorized(request: NextRequest) {
     return received.length === expected.length && timingSafeEqual(received, expected);
 }
 
-// The public API is POST /; proxy.ts rewrites that here because a route handler cannot share / with the landing page.
+/**
+ * The public API is POST /; proxy.ts rewrites that here because a route handler cannot share / with the landing page.
+ *
+ * A plan is identified by the path it was uploaded from (X-Plan-Path). Uploading from the same path again updates
+ * the plan at the same URL; a new path or no path at all creates a new plan.
+ */
 export async function POST(request: NextRequest) {
     if (!isAuthorized(request)) {
         return NextResponse.json(
@@ -32,6 +39,20 @@ export async function POST(request: NextRequest) {
             { status: 401 },
         );
     }
+
+    const path = request.headers.get("x-plan-path")?.trim();
+    if (path === "") {
+        return NextResponse.json(
+            {
+                error: "X-Plan-Path header is present but empty.",
+                fix: `Send the absolute path of the plan file so re-uploads update the same plan, or omit the header to create a new plan under a fresh name. Example: ${EXAMPLE_REQUEST}`,
+            },
+            { status: 400 },
+        );
+    }
+    // Keyed with the upload token so nobody can predict a plan URL from a guessable path like /tmp/plan.html. The
+    // trade-off: rotating the token gives every path a new URL on its next upload.
+    const source = path === undefined ? null : createHmac("sha256", env.UPLOAD_TOKEN).update(path).digest("hex");
 
     const html = await request.text();
     if (html.trim() === "") {
@@ -53,18 +74,24 @@ export async function POST(request: NextRequest) {
         );
     }
 
-    // Names are random words, so a fresh name can collide with a stored plan. Check candidates against R2 and take
-    // the first free one; the tiny window between check and write is an accepted race for a low-traffic service.
-    const candidates = Array.from({ length: 5 }, generatePlanName);
-    const taken = await Promise.all(candidates.map(planExists));
-    const key = candidates.find((_, index) => !taken[index]);
-    if (key === undefined) {
-        return NextResponse.json(
-            { error: "Could not find a free plan name after 5 attempts. Retry the request." },
-            { status: 500 },
-        );
+    // With a source the candidate names are derived from it, so a re-upload lands on the name it used before and
+    // overwrites its own plan. Without one they are random. A name is only written when it is free or already holds
+    // this source's plan; the window between check and write is an accepted race for a low-traffic service.
+    const candidates = Array.from({ length: NAME_ATTEMPTS }, (_, attempt) =>
+        source === null ? generatePlanName() : derivePlanName(`${source}:${attempt}`),
+    );
+    const existing = await Promise.all(candidates.map(headPlan));
+    const index = existing.findIndex((plan) => plan === null || (source !== null && plan.source === source));
+    if (index !== -1) {
+        const key = candidates[index];
+        await putPlan(key, html, source);
+        return NextResponse.json({ url: new URL(`/${key}`, siteUrl).href, updated: existing[index] !== null });
     }
-
-    await putPlan(key, html);
-    return NextResponse.json({ url: new URL(`/${key}`, siteUrl).href });
+    return NextResponse.json(
+        {
+            error: `Could not find a free plan name after ${NAME_ATTEMPTS} attempts.`,
+            fix: "Retry the request. If it keeps failing with an X-Plan-Path, upload from a different path.",
+        },
+        { status: 500 },
+    );
 }
